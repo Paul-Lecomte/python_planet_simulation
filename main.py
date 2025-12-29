@@ -24,6 +24,7 @@ class PlanetGenerator:
         self.h = height
         self.seed = seed if seed is not None else random.randrange(0, 1000000)
         self.noise = OpenSimplex(seed=self.seed)
+        self.rng = np.random.RandomState(self.seed)
 
     def octave_noise(self, x, y, z, octaves=5, persistence=0.5, lacunarity=2.0):
         amp = 1.0
@@ -31,7 +32,7 @@ class PlanetGenerator:
         total = 0.0
         max_amp = 0.0
         for _ in range(octaves):
-            # 'opensimplex' exposes noise3 (3D noise) in this environment
+            # 'opensimplex' expose noise3 (3D noise)
             total += amp * self.noise.noise3(x * freq, y * freq, z * freq)
             max_amp += amp
             amp *= persistence
@@ -41,31 +42,56 @@ class PlanetGenerator:
     def generate_elevation(self):
         w, h = self.w, self.h
         elev = np.zeros((h, w), dtype=np.float32)
+        # génération primaire avec couche de "ridge" pour montagnes plus marquées
         for j in range(h):
             lat = (j / (h - 1)) * math.pi - math.pi / 2  # -pi/2..pi/2
-            sin_lat = math.sin(lat)
-            cos_lat = math.cos(lat)
             for i in range(w):
                 lon = (i / (w - 1)) * 2 * math.pi - math.pi  # -pi..pi
                 x = math.cos(lat) * math.cos(lon)
                 y = math.sin(lat)
                 z = math.cos(lat) * math.sin(lon)
-                # base continental features (large scale)
+
+                # grandes masses continentales
                 n1 = self.octave_noise(x * 1.5, y * 1.5, z * 1.5, octaves=5)
-                # detail
+                # détails
                 n2 = self.octave_noise(x * 6.0, y * 6.0, z * 6.0, octaves=3)
-                val = 0.6 * n1 + 0.4 * n2
-                # bias towards oceans a bit
-                val = val - 0.15
+                # bruit haute fréquence pour créer des crêtes de montagne (ridge)
+                nm = self.octave_noise(x * 12.0, y * 12.0, z * 12.0, octaves=2)
+                ridge = abs(nm)
+
+                val = 0.55 * n1 + 0.35 * n2 + 0.22 * ridge
+                # bias vers océans
+                val = val - 0.2
                 elev[j, i] = val
-        # normalize to -1..1
+
+        # normaliser à -1..1
         minv = elev.min()
         maxv = elev.max()
         elev = (elev - minv) / (maxv - minv) * 2.0 - 1.0
-        return elev
+
+        # calculer pente approximative (gradient) pour placer forêts / villages
+        gy, gx = np.gradient(elev)
+        slope = np.sqrt(gx * gx + gy * gy)
+
+        # carte d'humidité (motif pour forêts) — bruit à fréquence moyenne
+        moisture = np.zeros_like(elev)
+        for j in range(h):
+            lat = (j / (h - 1)) * math.pi - math.pi / 2
+            for i in range(w):
+                lon = (i / (w - 1)) * 2 * math.pi - math.pi
+                x = math.cos(lat) * math.cos(lon)
+                y = math.sin(lat)
+                z = math.cos(lat) * math.sin(lon)
+                m = self.octave_noise(x * 3.0, y * 3.0, z * 3.0, octaves=3)
+                moisture[j, i] = m
+
+        # normaliser moisture 0..1
+        moisture = (moisture - moisture.min()) / (moisture.max() - moisture.min() + 1e-9)
+
+        return elev, slope, moisture
 
     def generate_texture(self):
-        elev = self.generate_elevation()
+        elev, slope, moisture = self.generate_elevation()
         h, w = elev.shape
         img = np.zeros((h, w, 3), dtype=np.uint8)
 
@@ -74,13 +100,17 @@ class PlanetGenerator:
         shallow_water = (50, 100, 200)
         sand = (194, 178, 128)
         grass = (90, 160, 80)
-        forest = (34, 110, 50)
+        forest = (30, 100, 45)
         rock = (120, 120, 120)
         snow = (240, 240, 240)
+        town_color = (200, 180, 160)
 
+        # colorisation de base
         for j in range(h):
             for i in range(w):
                 e = elev[j, i]
+                m = moisture[j, i]
+                s = slope[j, i]
                 if e < -0.25:
                     t = np.clip((e + 1.0) / 0.75, 0.0, 1.0)
                     c = blend_colors(deep_water, shallow_water, t)
@@ -91,8 +121,9 @@ class PlanetGenerator:
                     t = np.clip((e + 0.02) / 0.14, 0.0, 1.0)
                     c = blend_colors(sand, grass, t)
                 elif e < 0.45:
+                    base = blend_colors(grass, forest, np.clip((m - 0.35) / 0.65, 0.0, 1.0))
                     t = np.clip((e - 0.12) / 0.33, 0.0, 1.0)
-                    c = blend_colors(grass, forest, t)
+                    c = blend_colors(base, rock, t if s < 0.08 else min(1.0, t + 0.2))
                 elif e < 0.7:
                     t = np.clip((e - 0.45) / 0.25, 0.0, 1.0)
                     c = blend_colors(forest, rock, t)
@@ -100,17 +131,109 @@ class PlanetGenerator:
                     t = np.clip((e - 0.7) / 0.3, 0.0, 1.0)
                     c = blend_colors(rock, snow, t)
                 img[j, i] = c
-        return img
+
+        # petites variations de forêt
+        for j in range(h):
+            for i in range(w):
+                e = elev[j, i]
+                m = moisture[j, i]
+                s = slope[j, i]
+                if 0.02 <= e <= 0.45 and m > 0.4 and s < 0.08:
+                    dens = np.clip((m - 0.4) / 0.6, 0.0, 1.0) * (1.0 - min(1.0, s * 10.0))
+                    if self.rng.rand() < dens * 0.25:
+                        base = tuple(int(v) for v in img[j, i])
+                        img[j, i] = blend_colors(base, forest, 0.7)
+
+        # placement de villages
+        towns_count = 18
+        placed = 0
+        attempts = 0
+        max_attempts = towns_count * 40
+        town_mask = np.zeros((h, w), dtype=np.uint8)
+        while placed < towns_count and attempts < max_attempts:
+            attempts += 1
+            ci = self.rng.randint(0, w)
+            cj = self.rng.randint(0, h)
+            e = elev[cj, ci]
+            s = slope[cj, ci]
+            if not (-0.02 < e < 0.4):
+                continue
+            if s > 0.05:
+                continue
+            r = 8
+            y0 = max(0, cj - r)
+            y1 = min(h, cj + r + 1)
+            x0 = max(0, ci - r)
+            x1 = min(w, ci + r + 1)
+            win = elev[y0:y1, x0:x1]
+            if not np.any(win < -0.02):
+                continue
+            radius = self.rng.randint(2, 5)
+            yy, xx = np.ogrid[-radius:radius+1, -radius:radius+1]
+            mask = xx*xx + yy*yy <= radius*radius
+            for dy in range(-radius, radius+1):
+                for dx in range(-radius, radius+1):
+                    y = cj + dy
+                    x = ci + dx
+                    if 0 <= x < w and 0 <= y < h and mask[dy+radius, dx+radius]:
+                        base = tuple(int(v) for v in img[y, x])
+                        img[y, x] = blend_colors(base, town_color, 0.85)
+                        town_mask[y, x] = 1
+            placed += 1
+
+        # créer positions 3D et normales à partir de la heightmap
+        height_scale = 0.06
+        pos = np.zeros((h, w, 3), dtype=np.float32)
+        for j in range(h):
+            lat = (j / (h - 1)) * math.pi - math.pi / 2
+            for i in range(w):
+                lon = (i / (w - 1)) * 2 * math.pi - math.pi
+                r = 1.0 + elev[j, i] * height_scale
+                x = r * math.cos(lat) * math.cos(lon)
+                y = r * math.sin(lat)
+                z = r * math.cos(lat) * math.sin(lon)
+                pos[j, i, 0] = x
+                pos[j, i, 1] = y
+                pos[j, i, 2] = z
+
+        dlat = np.gradient(pos, axis=0)
+        dlon = np.gradient(pos, axis=1)
+        normals = np.cross(dlon, dlat)
+        norms = np.linalg.norm(normals, axis=2, keepdims=True)
+        norms[norms == 0] = 1.0
+        normals = normals / norms
+        normals = normals.astype(np.float32)
+
+        # ambient occlusion simple via blur of elevation
+        padded = np.pad(elev, ((1,1),(1,1)), mode='edge')
+        blurred = np.empty_like(elev)
+        for y in range(h):
+            for x in range(w):
+                blurred[y, x] = np.mean(padded[y:y+3, x:x+3])
+        ao = 1.0 - np.clip((blurred - elev) * 4.0, 0.0, 1.0)
+        ao = (0.6 + 0.4 * ao).astype(np.float32)
+
+        tex = {
+            'color': img,
+            'normal': normals,
+            'ao': ao,
+            'elev': elev,
+            'town_mask': town_mask
+        }
+        return tex
 
 class PlanetRenderer:
-    def __init__(self, texture, screen, radius=260):
-        self.texture = texture  # numpy array h,w,3
+    def __init__(self, texture_dict, screen, radius=260):
+        # texture_dict: {'color','normal','ao',...}
+        self.texture_dict = texture_dict
+        self.texture_color = texture_dict['color'] if texture_dict is not None else None
+        self.normal_map = texture_dict['normal'] if texture_dict is not None else None
+        self.ao_map = texture_dict['ao'] if texture_dict is not None else None
         self.screen = screen
         self.cx = SCREEN_W // 2
         self.cy = SCREEN_H // 2
         self.radius = radius
         self.scale = 1.0
-        # precompute sphere vectors for pixels inside circle
         self._precompute_pixel_vectors()
         self.yaw = 0.0
         self.pitch = 0.0
@@ -119,7 +242,6 @@ class PlanetRenderer:
         r = self.radius
         cx = self.cx
         cy = self.cy
-        # créer des grilles 2D de coordonnées écran pour avoir dx,dy de forme (H,W)
         xs, ys = np.meshgrid(np.arange(SCREEN_W), np.arange(SCREEN_H))
         dx = (xs - cx) / r
         dy = (ys - cy) / r
@@ -127,56 +249,61 @@ class PlanetRenderer:
         idxs = np.where(mask)
         px = dx[mask]
         py = dy[mask]
-        # on-screen coordinates -> sphere surface: z = sqrt(1 - x^2 - y^2)
         pz = np.sqrt(np.clip(1.0 - px * px - py * py, 0.0, 1.0))
-        # store in array shape (N,3)
         self.mask = mask
-        self.pixel_coords = np.stack((px, -py, pz), axis=1)  # y inverted to match screen
+        self.pixel_coords = np.stack((px, -py, pz), axis=1)
         self.index_y = idxs[0]
         self.index_x = idxs[1]
         self.N = self.pixel_coords.shape[0]
 
     def rotate_vectors(self, yaw, pitch):
-        # build rotation matrix (apply pitch then yaw)
         cy = math.cos(yaw)
         sy = math.sin(yaw)
         cp = math.cos(pitch)
         sp = math.sin(pitch)
-        # yaw around y-axis
         Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
-        # pitch around x-axis
         Rp = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])
         R = Ry @ Rp
-        # apply
         rotated = self.pixel_coords @ R.T
-        return rotated
+        return rotated, R
 
     def render(self, yaw, pitch, light_dir=(0.5, 1.0, 0.2)):
-        if self.texture is None:
+        if self.texture_color is None:
             return
-        tex_h, tex_w, _ = self.texture.shape
-        rotated = self.rotate_vectors(yaw, pitch)
+        tex_h, tex_w, _ = self.texture_color.shape
+        rotated, R = self.rotate_vectors(yaw, pitch)
         x_r = rotated[:, 0]
         y_r = rotated[:, 1]
         z_r = rotated[:, 2]
-        # spherical coords
-        lon = np.arctan2(z_r, x_r)  # -pi..pi
-        lat = np.arcsin(y_r)       # -pi/2..pi/2
+        lon = np.arctan2(z_r, x_r)
+        lat = np.arcsin(y_r)
         u = ((lon + math.pi) / (2 * math.pi)) * tex_w
         v = ((lat + math.pi/2) / math.pi) * tex_h
-        # wrap u
         u = np.mod(u, tex_w).astype(np.int32)
         v = np.clip(v.astype(np.int32), 0, tex_h - 1)
-        # sample texture
-        colors = self.texture[v, u]
-        # lighting: simple Lambertian with light_dir
-        ld = np.array(light_dir)
+        colors = self.texture_color[v, u].astype(np.float32)
+
+        # sample normal map and rotate
+        normals_tex = self.normal_map[v, u].astype(np.float32)
+        normals_rot = normals_tex @ R.T
+
+        # lighting
+        ld = np.array(light_dir, dtype=np.float32)
         ld = ld / np.linalg.norm(ld)
-        normals = rotated  # sphere normals
-        intensity = np.clip(normals @ ld, 0.0, 1.0)
+        intensity = np.clip(np.sum(normals_rot * ld[None, :], axis=1), 0.0, 1.0)
         intensity = intensity[:, None]
-        shaded = np.clip(colors.astype(np.float32) * (0.4 + 0.6 * intensity), 0, 255).astype(np.uint8)
-        # build full image and blit to screen
+        view_dir = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        half = (ld + view_dir)
+        half = half / np.linalg.norm(half)
+        spec_val = np.clip(np.sum(normals_rot * half[None, :], axis=1), 0.0, 1.0)
+        spec = (spec_val ** 32)[:, None].astype(np.float32)
+
+        ao = self.ao_map[v, u].astype(np.float32)[:, None]
+
+        shaded = colors * (0.2 + 0.8 * intensity)
+        shaded = np.clip(shaded + 200.0 * spec, 0, 255)
+        shaded = (shaded * ao).astype(np.uint8)
+
         surf_arr = np.zeros((SCREEN_H, SCREEN_W, 3), dtype=np.uint8)
         surf_arr[self.index_y, self.index_x] = shaded
         surf = pygame.surfarray.make_surface(surf_arr.swapaxes(0, 1))
@@ -241,7 +368,10 @@ def main():
                     texture_ready.clear()
                     threading.Thread(target=worker, daemon=True).start()
                     if renderer is not None:
-                        renderer.texture = None
+                        renderer.texture_dict = None
+                        renderer.texture_color = None
+                        renderer.normal_map = None
+                        renderer.ao_map = None
 
         screen.fill(BG_COLOR)
         # si texture prête, créer le renderer (la première fois) ou mettre à jour la texture
@@ -249,7 +379,12 @@ def main():
             if renderer is None:
                 renderer = PlanetRenderer(texture_holder["texture"], screen)
             else:
-                renderer.texture = texture_holder["texture"]
+                renderer.texture_dict = texture_holder["texture"]
+                # mettre à jour sous-cartes pour le renderer
+                if texture_holder["texture"] is not None:
+                    renderer.texture_color = texture_holder["texture"]["color"]
+                    renderer.normal_map = texture_holder["texture"]["normal"]
+                    renderer.ao_map = texture_holder["texture"]["ao"]
 
         if renderer is not None:
             renderer.render(renderer.yaw, renderer.pitch)
