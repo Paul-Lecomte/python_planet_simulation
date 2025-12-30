@@ -90,6 +90,52 @@ class PlanetGenerator:
 
         return elev, slope, moisture
 
+    def generate_cloud_map(self, width=None, height=None, samples=8, base=0.02, thickness=0.05, scale=3.0, smooth=1):
+        """
+        Pré-intégration de la densité de nuages: pour chaque texel (lon,lat)
+        on échantillonne le bruit 3D le long d'une colonne de hauteur (base..base+thickness)
+        et on moyenne pour obtenir une densité. On applique ensuite un lissage simple.
+        Cette méthode est exécutée à la génération (worker thread), donc elle peut être
+        un peu coûteuse.
+        """
+        w = self.w if width is None else width
+        h = self.h if height is None else height
+        cloud = np.zeros((h, w), dtype=np.float32)
+        # échantillonnage discret le long de la colonne
+        for j in range(h):
+            lat = (j / (h - 1)) * math.pi - math.pi / 2
+            cos_lat = math.cos(lat)
+            sin_lat = math.sin(lat)
+            for i in range(w):
+                lon = (i / (w - 1)) * 2 * math.pi - math.pi
+                sumd = 0.0
+                for k in range(samples):
+                    t = k / (samples - 1) if samples > 1 else 0.0
+                    r = 1.0 + base + t * thickness
+                    x = r * cos_lat * math.cos(lon)
+                    y = r * sin_lat
+                    z = r * cos_lat * math.sin(lon)
+                    n = self.octave_noise(x * scale, y * scale, z * scale, octaves=3)
+                    # normalize noise -1..1 -> 0..1
+                    sumd += (n * 0.5 + 0.5)
+                cloud[j, i] = sumd / samples
+
+        # normalize 0..1
+        cloud = (cloud - cloud.min()) / (cloud.max() - cloud.min() + 1e-9)
+        # boost contrast to form distinct cloud patches
+        cloud = np.clip((cloud - 0.4) * 1.6, 0.0, 1.0)
+
+        # simple box blur (1 pass)
+        if smooth and smooth > 0:
+            padded = np.pad(cloud, ((1, 1), (1, 1)), mode='edge')
+            tmp = np.empty_like(cloud)
+            for y in range(h):
+                for x in range(w):
+                    tmp[y, x] = np.mean(padded[y:y+3, x:x+3])
+            cloud = tmp
+
+        return cloud
+
     def generate_texture(self):
         elev, slope, moisture = self.generate_elevation()
         h, w = elev.shape
@@ -213,12 +259,16 @@ class PlanetGenerator:
         ao = 1.0 - np.clip((blurred - elev) * 4.0, 0.0, 1.0)
         ao = (0.6 + 0.4 * ao).astype(np.float32)
 
+        # generate cloud density map
+        cloud = self.generate_cloud_map(width=w, height=h, samples=8, base=0.02, thickness=0.05, scale=3.0, smooth=1)
+
         tex = {
             'color': img,
             'normal': normals,
             'ao': ao,
             'elev': elev,
-            'town_mask': town_mask
+            'town_mask': town_mask,
+            'cloud_density': cloud
         }
         return tex
 
@@ -229,6 +279,7 @@ class PlanetRenderer:
         self.texture_color = texture_dict['color'] if texture_dict is not None else None
         self.normal_map = texture_dict['normal'] if texture_dict is not None else None
         self.ao_map = texture_dict['ao'] if texture_dict is not None else None
+        self.cloud_map = texture_dict.get('cloud_density', None) if texture_dict is not None else None
         self.screen = screen
         self.cx = SCREEN_W // 2
         self.cy = SCREEN_H // 2
@@ -237,6 +288,16 @@ class PlanetRenderer:
         self._precompute_pixel_vectors()
         self.yaw = 0.0
         self.pitch = 0.0
+        # cloud rendering params
+        self.cloud_shadow_k = 2.0
+        self.cloud_ambient = 0.25
+        self.cloud_albedo = 1.0
+        # cloud animation (uv offset in texel units) and wind (fraction of texture per second)
+        # cloud_wind is fraction of full texture per second (u_fraction, v_fraction)
+        self.cloud_offset = np.array([0.0, 0.0], dtype=np.float32)
+        self.cloud_wind = np.array([0.02, 0.0], dtype=np.float32)  # slow eastward wind by default
+        # shadow sampling distance (fraction of texture width/height to offset when sampling shadow)
+        self.cloud_shadow_uv = 0.06
 
     def _precompute_pixel_vectors(self):
         r = self.radius
@@ -277,10 +338,12 @@ class PlanetRenderer:
         z_r = rotated[:, 2]
         lon = np.arctan2(z_r, x_r)
         lat = np.arcsin(y_r)
-        u = ((lon + math.pi) / (2 * math.pi)) * tex_w
-        v = ((lat + math.pi/2) / math.pi) * tex_h
-        u = np.mod(u, tex_w).astype(np.int32)
-        v = np.clip(v.astype(np.int32), 0, tex_h - 1)
+        # compute float UV for bilinear sampling
+        u_f = ((lon + math.pi) / (2 * math.pi)) * tex_w
+        v_f = ((lat + math.pi/2) / math.pi) * tex_h
+        # integer indices for nearest color lookup (wrap lon)
+        u = np.mod(u_f, tex_w).astype(np.int32)
+        v = np.clip(v_f.astype(np.int32), 0, tex_h - 1)
         colors = self.texture_color[v, u].astype(np.float32)
 
         # sample normal map and rotate
@@ -300,12 +363,85 @@ class PlanetRenderer:
 
         ao = self.ao_map[v, u].astype(np.float32)[:, None]
 
+        # base shaded surface (keep float for later blending)
         shaded = colors * (0.2 + 0.8 * intensity)
         shaded = np.clip(shaded + 200.0 * spec, 0, 255)
-        shaded = (shaded * ao).astype(np.uint8)
+        shaded = shaded * ao
 
+        # cloud compositing (animated bilinear sampling + directional shadow approximation)
+        if self.cloud_map is not None:
+            cloud = self.cloud_map
+            cf = u_f.copy()
+            vf = v_f.copy()
+            # update cloud offset using wall time (seconds)
+            now = pygame.time.get_ticks() / 1000.0
+            if not hasattr(self, '_last_time'):
+                self._last_time = now
+            dt = max(0.0, now - self._last_time)
+            self._last_time = now
+            # wind given in fraction of texture per second -> convert to texels
+            self.cloud_offset[0] = (self.cloud_offset[0] + self.cloud_wind[0] * tex_w * dt) % tex_w
+            self.cloud_offset[1] = self.cloud_offset[1] + self.cloud_wind[1] * tex_h * dt
+
+            # apply advection offset to sampling coordinates
+            cf_m = (cf + self.cloud_offset[0]) % tex_w
+            vf_m = np.clip(vf + self.cloud_offset[1], 0.0, tex_h - 1.0)
+
+            # bilinear sample at moved coordinates to get local cloud density
+            u0 = np.floor(cf_m).astype(np.int32) % tex_w
+            v0 = np.floor(vf_m).astype(np.int32)
+            v0 = np.clip(v0, 0, tex_h - 1)
+            u1 = (u0 + 1) % tex_w
+            v1 = np.clip(v0 + 1, 0, tex_h - 1)
+            fu = (cf_m - np.floor(cf_m)).astype(np.float32)
+            fv = (vf_m - np.floor(vf_m)).astype(np.float32)
+            d00 = cloud[v0, u0]
+            d10 = cloud[v0, u1]
+            d01 = cloud[v1, u0]
+            d11 = cloud[v1, u1]
+            density = (d00 * (1 - fu) * (1 - fv) + d10 * fu * (1 - fv) + d01 * (1 - fu) * fv + d11 * fu * fv)
+            density = np.clip(density, 0.0, 1.0)
+
+            # approximate directional shadow: sample cloud density at an offset along the light direction
+            # use light direction components to compute a small UV shift (fraction of texture)
+            shadow_uv = self.cloud_shadow_uv
+            # offset in texels: negative because shadow falls opposite the sun direction
+            u_shadow_offset = -ld[0] * shadow_uv * tex_w
+            v_shadow_offset = -ld[1] * shadow_uv * tex_h
+            cf_s = (cf_m + u_shadow_offset) % tex_w
+            vf_s = np.clip(vf_m + v_shadow_offset, 0.0, tex_h - 1.0)
+
+            u0s = np.floor(cf_s).astype(np.int32) % tex_w
+            v0s = np.floor(vf_s).astype(np.int32)
+            v0s = np.clip(v0s, 0, tex_h - 1)
+            u1s = (u0s + 1) % tex_w
+            v1s = np.clip(v0s + 1, 0, tex_h - 1)
+            fus = (cf_s - np.floor(cf_s)).astype(np.float32)
+            fvs = (vf_s - np.floor(vf_s)).astype(np.float32)
+            sd00 = cloud[v0s, u0s]
+            sd10 = cloud[v0s, u1s]
+            sd01 = cloud[v1s, u0s]
+            sd11 = cloud[v1s, u1s]
+            density_shadow = (sd00 * (1 - fus) * (1 - fvs) + sd10 * fus * (1 - fvs) + sd01 * (1 - fus) * fvs + sd11 * fus * fvs)
+            density_shadow = np.clip(density_shadow, 0.0, 1.0)
+
+            # cloud lighting based on spherical direction (for cloud brightening)
+            lit = np.clip(np.sum(rotated * ld[None, :], axis=1), 0.0, 1.0)
+            cloud_rgb = (255.0 * (self.cloud_ambient + (1.0 - self.cloud_ambient) * lit))
+
+            # apply shadow to surface using the shadowed density (directional approx)
+            shadow = np.exp(-self.cloud_shadow_k * density_shadow).astype(np.float32)
+            shaded = shaded * shadow[:, None]
+
+            # alpha and compose clouds over shaded surface (use local density for alpha)
+            alpha = np.clip(density * 1.4, 0.0, 1.0).astype(np.float32)
+            cloud_rgb3 = np.stack([cloud_rgb, cloud_rgb, cloud_rgb], axis=1)
+            shaded = cloud_rgb3 * alpha[:, None] + shaded * (1.0 - alpha)[:, None]
+
+        # finalize and write to surface buffer
+        final_colors = np.clip(shaded, 0, 255).astype(np.uint8)
         surf_arr = np.zeros((SCREEN_H, SCREEN_W, 3), dtype=np.uint8)
-        surf_arr[self.index_y, self.index_x] = shaded
+        surf_arr[self.index_y, self.index_x] = final_colors
         surf = pygame.surfarray.make_surface(surf_arr.swapaxes(0, 1))
         self.screen.blit(surf, (0, 0))
 
@@ -372,6 +508,7 @@ def main():
                         renderer.texture_color = None
                         renderer.normal_map = None
                         renderer.ao_map = None
+                        renderer.cloud_map = None
 
         screen.fill(BG_COLOR)
         # si texture prête, créer le renderer (la première fois) ou mettre à jour la texture
@@ -385,6 +522,7 @@ def main():
                     renderer.texture_color = texture_holder["texture"]["color"]
                     renderer.normal_map = texture_holder["texture"]["normal"]
                     renderer.ao_map = texture_holder["texture"]["ao"]
+                    renderer.cloud_map = texture_holder["texture"].get("cloud_density", None)
 
         if renderer is not None:
             renderer.render(renderer.yaw, renderer.pitch)
