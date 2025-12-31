@@ -18,6 +18,57 @@ def lerp(a, b, t):
 def blend_colors(c1, c2, t):
     return tuple(int(lerp(c1[i], c2[i], t)) for i in range(3))
 
+class SpaceBackground:
+    def __init__(self, width, height, seed=42):
+        self.width = width
+        self.height = height
+        self.surface = pygame.Surface((width, height))
+        self.noise = OpenSimplex(seed=seed)
+        self.generate()
+
+    def generate(self):
+        self.surface.fill((5, 5, 15))  # Deep space color
+
+        # Generate nebula/galaxies using noise
+        for y in range(0, self.height, 2):
+            for x in range(0, self.width, 2):
+                n = self.noise.noise2(x * 0.005, y * 0.005)
+                if n > 0.3:
+                    # Blue/Purple nebula
+                    r = int(20 * (n - 0.3))
+                    g = int(10 * (n - 0.3))
+                    b = int(50 * (n - 0.3))
+                    pygame.draw.rect(self.surface, (min(r, 255), min(g, 255), min(b, 255)), (x, y, 2, 2))
+                elif n < -0.4:
+                    # Reddish nebula
+                    r = int(40 * abs(n + 0.4))
+                    g = int(5 * abs(n + 0.4))
+                    b = int(10 * abs(n + 0.4))
+                    pygame.draw.rect(self.surface, (min(r, 255), min(g, 255), min(b, 255)), (x, y, 2, 2))
+
+        # Generate stars
+        for _ in range(300):
+            x = random.randint(0, self.width - 1)
+            y = random.randint(0, self.height - 1)
+            size = random.choice([1, 1, 1, 2])
+            brightness = random.randint(150, 255)
+            color = (brightness, brightness, brightness)
+            if size == 1:
+                self.surface.set_at((x, y), color)
+            else:
+                pygame.draw.circle(self.surface, color, (x, y), size - 0.5)
+
+    def draw(self, screen, yaw=0, pitch=0):
+        # Subtle parallax effect
+        ox = int(yaw * 20) % self.width
+        oy = int(pitch * 20) % self.height
+        
+        # Draw with wrapping for parallax
+        screen.blit(self.surface, (-ox, -oy))
+        screen.blit(self.surface, (self.width - ox, -oy))
+        screen.blit(self.surface, (-ox, self.height - oy))
+        screen.blit(self.surface, (self.width - ox, self.height - oy))
+
 class PlanetGenerator:
     def __init__(self, width=TEX_W, height=TEX_H, seed=None):
         self.w = width
@@ -443,6 +494,7 @@ class PlanetRenderer:
         surf_arr = np.zeros((SCREEN_H, SCREEN_W, 3), dtype=np.uint8)
         surf_arr[self.index_y, self.index_x] = final_colors
         surf = pygame.surfarray.make_surface(surf_arr.swapaxes(0, 1))
+        surf.set_colorkey((0, 0, 0))
         self.screen.blit(surf, (0, 0))
 
 def main():
@@ -455,6 +507,8 @@ def main():
     generator = PlanetGenerator()
     texture_holder = {"texture": None}
     texture_ready = threading.Event()
+    
+    bg = SpaceBackground(SCREEN_W, SCREEN_H)
 
     def worker():
         texture_holder["texture"] = generator.generate_texture()
@@ -510,7 +564,12 @@ def main():
                         renderer.ao_map = None
                         renderer.cloud_map = None
 
-        screen.fill(BG_COLOR)
+        # screen.fill(BG_COLOR)
+        if renderer is not None:
+            bg.draw(screen, renderer.yaw, renderer.pitch)
+        else:
+            bg.draw(screen, 0, 0)
+            
         # si texture prête, créer le renderer (la première fois) ou mettre à jour la texture
         if texture_ready.is_set():
             if renderer is None:
