@@ -124,8 +124,9 @@ class PlanetGenerator:
         gy, gx = np.gradient(elev)
         slope = np.sqrt(gx * gx + gy * gy)
 
-        # carte d'humidité (motif pour forêts) — bruit à fréquence moyenne
+        # carte d'humidité et température
         moisture = np.zeros_like(elev)
+        temp = np.zeros_like(elev)
         for j in range(h):
             lat = (j / (h - 1)) * math.pi - math.pi / 2
             for i in range(w):
@@ -133,13 +134,28 @@ class PlanetGenerator:
                 x = math.cos(lat) * math.cos(lon)
                 y = math.sin(lat)
                 z = math.cos(lat) * math.sin(lon)
+                
+                # Humidité: bruit à fréquence moyenne
                 m = self.octave_noise(x * 3.0, y * 3.0, z * 3.0, octaves=3)
                 moisture[j, i] = m
 
+                # Température: Latitude (chaud à l'équateur) + Altitude + Bruit
+                # Base latitude: cos(lat) est 1 à l'équateur (lat=0), 0 aux pôles (lat=+-pi/2)
+                t_lat = math.cos(lat)
+                # Influence altitude: plus c'est haut, plus c'est froid
+                # elev est -1..1, on utilise la partie positive (>0) pour refroidir
+                t_alt = -0.5 * max(0, elev[j, i])
+                # Variation locale (bruit)
+                t_noise = 0.2 * self.octave_noise(x * 2.0, y * 2.0, z * 2.0, octaves=2)
+                
+                temp[j, i] = t_lat + t_alt + t_noise
+
         # normaliser moisture 0..1
         moisture = (moisture - moisture.min()) / (moisture.max() - moisture.min() + 1e-9)
+        # normaliser temp 0..1
+        temp = (temp - temp.min()) / (temp.max() - temp.min() + 1e-9)
 
-        return elev, slope, moisture
+        return elev, slope, moisture, temp
 
     def generate_cloud_map(self, width=None, height=None, samples=8, base=0.02, thickness=0.05, scale=3.0, smooth=1):
         """
@@ -188,58 +204,75 @@ class PlanetGenerator:
         return cloud
 
     def generate_texture(self):
-        elev, slope, moisture = self.generate_elevation()
+        elev, slope, moisture, temp = self.generate_elevation()
         h, w = elev.shape
         img = np.zeros((h, w, 3), dtype=np.uint8)
 
-        # palette
+        # palette étendue pour biomes
         deep_water = (7, 25, 95)
         shallow_water = (50, 100, 200)
-        sand = (194, 178, 128)
-        grass = (90, 160, 80)
-        forest = (30, 100, 45)
-        rock = (120, 120, 120)
-        snow = (240, 240, 240)
+        sand = (210, 185, 135)
+        
+        # Biomes terrestres
+        tundra = (150, 160, 170)
+        taiga = (40, 70, 50)
+        grassland = (110, 160, 70)
+        temperate_forest = (30, 90, 40)
+        tropical_rainforest = (10, 60, 20)
+        savanna = (180, 170, 80)
+        desert = (220, 190, 130)
+        rock = (110, 110, 110)
+        snow = (245, 245, 255)
         town_color = (200, 180, 160)
 
-        # colorisation de base
+        def get_biome_color(t, m):
+            # t, m sont 0..1
+            if t < 0.25:
+                if m < 0.3: return tundra
+                return taiga
+            if t < 0.6:
+                if m < 0.4: return grassland
+                return temperate_forest
+            # t >= 0.6 (hot)
+            if m < 0.25: return desert
+            if m < 0.5: return savanna
+            return tropical_rainforest
+
+        # colorisation
         for j in range(h):
             for i in range(w):
                 e = elev[j, i]
                 m = moisture[j, i]
+                t = temp[j, i]
                 s = slope[j, i]
+
                 if e < -0.25:
-                    t = np.clip((e + 1.0) / 0.75, 0.0, 1.0)
-                    c = blend_colors(deep_water, shallow_water, t)
+                    k = np.clip((e + 1.0) / 0.75, 0.0, 1.0)
+                    c = blend_colors(deep_water, shallow_water, k)
                 elif e < -0.02:
-                    t = np.clip((e + 0.25) / 0.23, 0.0, 1.0)
-                    c = blend_colors(shallow_water, sand, t)
-                elif e < 0.12:
-                    t = np.clip((e + 0.02) / 0.14, 0.0, 1.0)
-                    c = blend_colors(sand, grass, t)
-                elif e < 0.45:
-                    base = blend_colors(grass, forest, np.clip((m - 0.35) / 0.65, 0.0, 1.0))
-                    t = np.clip((e - 0.12) / 0.33, 0.0, 1.0)
-                    c = blend_colors(base, rock, t if s < 0.08 else min(1.0, t + 0.2))
+                    k = np.clip((e + 0.25) / 0.23, 0.0, 1.0)
+                    c = blend_colors(shallow_water, sand, k)
                 elif e < 0.7:
-                    t = np.clip((e - 0.45) / 0.25, 0.0, 1.0)
-                    c = blend_colors(forest, rock, t)
+                    # Biomes basés sur Température et Humidité
+                    base_c = get_biome_color(t, m)
+                    # Mélange avec roche si la pente est forte ou si l'altitude augmente
+                    k_slope = np.clip(s * 8.0, 0.0, 1.0)
+                    k_elev = np.clip((e - 0.4) / 0.3, 0.0, 1.0)
+                    c = blend_colors(base_c, rock, max(k_slope, k_elev))
                 else:
-                    t = np.clip((e - 0.7) / 0.3, 0.0, 1.0)
-                    c = blend_colors(rock, snow, t)
+                    # Très haute altitude : Neige
+                    k = np.clip((e - 0.7) / 0.3, 0.0, 1.0)
+                    c = blend_colors(rock, snow, k)
+                
                 img[j, i] = c
 
-        # petites variations de forêt
+        # petites variations de détails (facultatif, on garde un peu de bruit)
         for j in range(h):
             for i in range(w):
-                e = elev[j, i]
-                m = moisture[j, i]
-                s = slope[j, i]
-                if 0.02 <= e <= 0.45 and m > 0.4 and s < 0.08:
-                    dens = np.clip((m - 0.4) / 0.6, 0.0, 1.0) * (1.0 - min(1.0, s * 10.0))
-                    if self.rng.rand() < dens * 0.25:
-                        base = tuple(int(v) for v in img[j, i])
-                        img[j, i] = blend_colors(base, forest, 0.7)
+                if elev[j, i] > 0 and self.rng.rand() < 0.05:
+                    pixel = np.array(img[j, i], dtype=np.int16)
+                    noise = self.rng.randint(-5, 5)
+                    img[j, i] = tuple(np.clip(pixel + noise, 0, 255).astype(np.uint8))
 
         # placement de villages
         towns_count = 18
