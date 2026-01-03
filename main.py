@@ -4,6 +4,7 @@ import numpy as np
 import pygame
 from opensimplex import OpenSimplex
 import threading
+from typing import List, Dict, Any
 
 # Paramètres
 TEX_W = 512
@@ -280,16 +281,29 @@ class PlanetGenerator:
         attempts = 0
         max_attempts = towns_count * 40
         town_mask = np.zeros((h, w), dtype=np.uint8)
+        towns: List[Dict[str, Any]] = []
+
+        def gen_name(rng):
+            syllables = ['al', 'an', 'ar', 'ba', 'bel', 'dor', 'el', 'en', 'fin', 'gal', 'ha', 'in', 'kas', 'la', 'lor', 'mar', 'na', 'or', 'ra', 'sa', 'tan', 'ul', 'ver']
+            n = rng.randint(2, 4)
+            name = ''.join(rng.choice(syllables) for _ in range(n)).capitalize()
+            # add small suffix sometimes
+            if rng.rand() < 0.25:
+                name += rng.choice(['', 'ton', 'ville', 'burg', 'grad'])
+            return name
+
         while placed < towns_count and attempts < max_attempts:
             attempts += 1
             ci = self.rng.randint(0, w)
             cj = self.rng.randint(0, h)
             e = elev[cj, ci]
             s = slope[cj, ci]
+            # prefer coastal/lowland gently sloped
             if not (-0.02 < e < 0.4):
                 continue
             if s > 0.05:
                 continue
+            # require some nearby water (coastal) to increase interest
             r = 8
             y0 = max(0, cj - r)
             y1 = min(h, cj + r + 1)
@@ -298,7 +312,8 @@ class PlanetGenerator:
             win = elev[y0:y1, x0:x1]
             if not np.any(win < -0.02):
                 continue
-            radius = self.rng.randint(2, 5)
+
+            radius = int(self.rng.randint(2, 6))
             yy, xx = np.ogrid[-radius:radius+1, -radius:radius+1]
             mask = xx*xx + yy*yy <= radius*radius
             for dy in range(-radius, radius+1):
@@ -309,6 +324,33 @@ class PlanetGenerator:
                         base = tuple(int(v) for v in img[y, x])
                         img[y, x] = blend_colors(base, town_color, 0.85)
                         town_mask[y, x] = 1
+
+            # compute lat/lon and unit vector
+            lon = (ci / (w - 1)) * 2 * math.pi - math.pi
+            lat = (cj / (h - 1)) * math.pi - math.pi / 2
+            ux = math.cos(lat) * math.cos(lon)
+            uy = math.sin(lat)
+            uz = math.cos(lat) * math.sin(lon)
+
+            # population roughly scales with area
+            population = int(max(50, (radius ** 2) * (50 + self.rng.randint(-20, 80))))
+            if population > 2000:
+                typ = 'city'
+            elif population > 600:
+                typ = 'town'
+            else:
+                typ = 'village'
+
+            town = {
+                'i': int(ci), 'j': int(cj),
+                'lon': float(lon), 'lat': float(lat),
+                'ux': float(ux), 'uy': float(uy), 'uz': float(uz),
+                'radius': int(radius),
+                'population': population,
+                'type': typ,
+                'name': gen_name(self.rng)
+            }
+            towns.append(town)
             placed += 1
 
         # créer positions 3D et normales à partir de la heightmap
@@ -352,6 +394,7 @@ class PlanetGenerator:
             'ao': ao,
             'elev': elev,
             'town_mask': town_mask,
+            'towns': towns,
             'cloud_density': cloud
         }
         return tex
@@ -364,6 +407,15 @@ class PlanetRenderer:
         self.normal_map = texture_dict['normal'] if texture_dict is not None else None
         self.ao_map = texture_dict['ao'] if texture_dict is not None else None
         self.cloud_map = texture_dict.get('cloud_density', None) if texture_dict is not None else None
+        # towns list (each: name,type,population,ux,uy,uz,radius)
+        self.towns = texture_dict.get('towns', []) if texture_dict is not None else []
+        # font for labels
+        try:
+            self.town_font = pygame.font.SysFont('arial', 12)
+            self.town_big_font = pygame.font.SysFont('arial', 14, bold=True)
+        except Exception:
+            self.town_font = None
+            self.town_big_font = None
         self.screen = screen
         self.cx = SCREEN_W // 2
         self.cy = SCREEN_H // 2
@@ -530,6 +582,39 @@ class PlanetRenderer:
         surf.set_colorkey((0, 0, 0))
         self.screen.blit(surf, (0, 0))
 
+        # draw towns/icons as overlay using current rotation R
+        if hasattr(self, 'towns') and self.towns:
+            for town in self.towns:
+                # world unit vector
+                v = np.array([town['ux'], town['uy'], town['uz']], dtype=np.float32)
+                # rotate to camera space (apply same R)
+                v_rot = v @ R.T
+                # visible if z component positive
+                if v_rot[2] <= 0.0:
+                    continue
+                # project to screen (approx perspective via dividing by z)
+                dx = (v_rot[0] / v_rot[2]) * self.radius
+                dy = -(v_rot[1] / v_rot[2]) * self.radius
+                sx = int(self.cx + dx)
+                sy = int(self.cy + dy)
+                # simple occlusion: check within screen and roughly on the planet disc
+                if sx < 0 or sx >= SCREEN_W or sy < 0 or sy >= SCREEN_H:
+                    continue
+                # size by type/population and distance (farther z -> smaller)
+                size = max(2, int(4 * (town['radius'] / 4.0) * (v_rot[2])))
+                color = (240, 200, 150) if town.get('type') == 'city' else (220, 180, 140)
+                # draw halo + dot
+                # halo (opaque darker circle) then dot
+                pygame.draw.circle(self.screen, (10, 10, 10), (sx, sy), size+2)
+                pygame.draw.circle(self.screen, color, (sx, sy), size)
+                # label cities and towns when visible
+                if town.get('type') in ('city', 'town') and self.town_font is not None:
+                    font = self.town_big_font if town.get('type') == 'city' else self.town_font
+                    label = f"{town.get('name')} ({town.get('population')})"
+                    surf_t = font.render(label, True, (240,240,240))
+                    # offset label to avoid overlap with dot
+                    self.screen.blit(surf_t, (sx + size + 4, sy - surf_t.get_height() // 2))
+
 def main():
     pygame.init()
     screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
@@ -615,6 +700,7 @@ def main():
                     renderer.normal_map = texture_holder["texture"]["normal"]
                     renderer.ao_map = texture_holder["texture"]["ao"]
                     renderer.cloud_map = texture_holder["texture"].get("cloud_density", None)
+                    renderer.towns = texture_holder["texture"].get("towns", [])
 
         if renderer is not None:
             renderer.render(renderer.yaw, renderer.pitch)
